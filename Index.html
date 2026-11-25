@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photo Booth</title>
+<style>
+:root{--bg:#f4f4f7;--panel:#ffffff;--text:#1d1d22;--muted:#6b6b75;--accent:#e4405f;--border:#d8d8e0;--stage:#000}
+@media (prefers-color-scheme:dark){:root{--bg:#1e1e24;--panel:#2b2b33;--text:#eaeaea;--muted:#a0a0ab;--accent:#ff5c7a;--border:#44444f}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 "Segoe UI",system-ui,sans-serif;padding:16px}
+h1{font-size:20px;margin:0 0 12px}
+.wrap{display:flex;flex-wrap:wrap;gap:16px;max-width:1100px;margin:0 auto}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px}
+.stage{flex:1 1 480px;min-width:280px}
+.view{position:relative;aspect-ratio:4/3;background:var(--stage);border-radius:8px;overflow:hidden}
+.view video{width:100%;height:100%;object-fit:cover;display:block}
+.view video.mirror{transform:scaleX(-1)}
+#overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:min(30vw,200px);font-weight:700;color:#fff;text-shadow:0 4px 24px rgba(0,0,0,.6);pointer-events:none}
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .35s}
+#flash.on{opacity:.85;transition:none}
+#status{text-align:center;font-weight:600;margin-top:8px;min-height:1.4em}
+.result{flex:0 1 340px;min-width:240px;display:flex;flex-direction:column;align-items:center}
+.result h2{font-size:16px;margin:0 0 8px;align-self:flex-start}
+#result{max-width:100%;max-height:560px;width:auto;height:auto;border-radius:4px;box-shadow:0 2px 12px rgba(0,0,0,.25)}
+.controls{flex:1 1 100%;display:flex;flex-direction:column;gap:10px}
+.row{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center}
+label{display:inline-flex;align-items:center;gap:6px}
+input[type=text],input[type=number],select{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;font:inherit}
+input[type=number]{width:60px}
+input[type=color]{width:36px;height:30px;padding:0;border:1px solid var(--border);border-radius:6px;background:none}
+button{font:inherit;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);cursor:pointer}
+button:hover:not(:disabled){border-color:var(--accent)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;font-size:16px;padding:11px 22px}
+#printArea{display:none}
+@media print{
+  @page{margin:8mm}
+  body>*:not(#printArea){display:none!important}
+  body{padding:0;background:#fff}
+  #printArea{display:flex;justify-content:center}
+  #printArea img{max-width:100%;max-height:calc(100vh - 4mm);object-fit:contain}
+}
+</style>
+</head>
+<body>
+<h1>📷 Photo Booth</h1>
+<div class="wrap">
+  <div class="card stage">
+    <div class="view">
+      <video id="video" class="mirror" autoplay playsinline muted></video>
+      <div id="overlay"></div>
+      <div id="flash"></div>
+    </div>
+    <div id="status">Starting camera…</div>
+  </div>
+
+  <div class="card result">
+    <h2>Result</h2>
+    <canvas id="result"></canvas>
+  </div>
+
+  <div class="card controls">
+    <div class="row">
+      <strong>Mode:</strong>
+      <label><input type="radio" name="mode" value="1" checked> Single</label>
+      <label><input type="radio" name="mode" value="4"> Strip (4 in a column)</label>
+      <label>Countdown <input type="number" id="cd" min="0" max="10" value="3"> s</label>
+      <label>Camera <select id="cam"></select></label>
+      <label><input type="checkbox" id="mirror" checked> Mirror</label>
+    </div>
+    <div class="row">
+      <label>Caption <input type="text" id="caption" value="PHOTO BOOTH" size="24"></label>
+      <label>Frame style <select id="style"><option value="candy">Pink candy Christmas</option><option value="solid">Solid color</option></select></label>
+      <label>Solid color <input type="color" id="color" value="#ffffff"></label>
+      <label>Format <select id="fmt"><option value="png">PNG</option><option value="jpg">JPG</option></select></label>
+    </div>
+    <div class="row">
+      <button class="primary" id="btnCapture">📷 Capture (Space)</button>
+      <button id="btnRetake">Retake</button>
+      <button id="btnSave" disabled>💾 Save / Download</button>
+      <button id="btnPrint" disabled>🖨 Print</button>
+    </div>
+  </div>
+</div>
+<div id="printArea"><img id="printImg" alt="Photo booth print"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), result = $('result'), cam = $('cam');
+let stream = null, shots = [], total = 1, busy = false;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const setStatus = t => $('status').textContent = t;
+const mode = () => +document.querySelector('input[name=mode]:checked').value;
+const complete = () => !busy && shots.length > 0 && shots.length === total;
+
+/* ---------- camera ---------- */
+async function startCam(deviceId) {
+  try {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: deviceId ? { exact: deviceId } : undefined, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+    if (cam.options.length !== devs.length) {
+      cam.innerHTML = '';
+      devs.forEach((d, i) => cam.add(new Option(d.label || 'Camera ' + (i + 1), d.deviceId)));
+    }
+    const cur = stream.getVideoTracks()[0].getSettings().deviceId;
+    if (cur) cam.value = cur;
+    setStatus('Ready');
+  } catch (e) {
+    setStatus('Camera unavailable: ' + e.message + ' (allow camera access, and open the file over https or from your computer)');
+  }
+}
+
+/* ---------- capture + compose ---------- */
+function grab(w, h) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d');
+  const vw = video.videoWidth, vh = video.videoHeight;
+  let sw = vw, sh = vw * 3 / 4;
+  if (sh > vh) { sh = vh; sw = vh * 4 / 3; }
+  if ($('mirror').checked) { x.translate(w, 0); x.scale(-1, 1); }
+  x.drawImage(video, (vw - sw) / 2, (vh - sh) / 2, sw, sh, 0, 0, w, h);
+  return c;
+}
+const tileSize = () => total === 1 ? [1200, 900] : [600, 450];
+
+function isDark(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) < 140;
+}
+
+/* ---------- pink candy Christmas frame ---------- */
+const RED = '#d4143c';
+function candyBorder(x, W, H, pad) {
+  const bw = Math.round(pad * 0.3), s = bw * 1.4;
+  x.save();
+  x.beginPath(); x.rect(0, 0, W, H); x.rect(bw, bw, W - 2 * bw, H - 2 * bw); x.clip('evenodd');
+  x.fillStyle = '#fff'; x.fillRect(0, 0, W, H);
+  x.fillStyle = RED;
+  for (let i = -H; i < W + H; i += s * 2) {
+    x.beginPath(); x.moveTo(i, 0); x.lineTo(i + s, 0); x.lineTo(i + s + H, H); x.lineTo(i + H, H); x.fill();
+  }
+  x.restore();
+}
+function peppermint(x, cx, cy, r) {
+  x.save(); x.translate(cx, cy);
+  x.beginPath(); x.arc(0, 0, r, 0, Math.PI * 2); x.fillStyle = '#fff'; x.fill();
+  x.fillStyle = RED;
+  for (let k = 0; k < 8; k++) {
+    x.beginPath(); x.moveTo(0, 0); x.arc(0, 0, r, k * Math.PI / 4, k * Math.PI / 4 + Math.PI / 8); x.closePath(); x.fill();
+  }
+  x.lineWidth = Math.max(2, r * 0.12); x.strokeStyle = '#fff';
+  x.beginPath(); x.arc(0, 0, r - x.lineWidth / 2, 0, Math.PI * 2); x.stroke();
+  x.restore();
+}
+function sprinkles(x, W, fy, footer, pad, k) {
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const cols = ['#ffffff', RED, '#1b9e5a', '#ffe08a'];
+  for (let i = 0; i < 48; i++) {
+    const px = pad + rnd() * (W - 2 * pad), py = fy + 10 + rnd() * (footer - pad * 0.7 - 10);
+    x.save(); x.translate(px, py); x.fillStyle = cols[i % 4];
+    if (i % 3 === 0) { x.beginPath(); x.arc(0, 0, (3 + rnd() * 4) * k, 0, Math.PI * 2); x.fill(); }
+    else { x.rotate(rnd() * Math.PI); x.fillRect(-7 * k, -2.5 * k, 14 * k, 5 * k); }
+    x.restore();
+  }
+}
+
+function render() {
+  const [tw, th] = tileSize();
+  const pad = total === 1 ? 60 : 40, gap = total === 1 ? 0 : 30, footer = 170;
+  const W = tw + 2 * pad, H = pad + total * th + (total - 1) * gap + footer;
+  result.width = W; result.height = H;
+  const x = result.getContext('2d');
+  const candy = $('style').value === 'candy';
+  const bg = $('color').value, fg = candy ? '#c8102e' : (isDark(bg) ? '#fff' : '#000');
+  if (candy) {
+    const g = x.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#ffd6e7'); g.addColorStop(1, '#ff9fc6'); x.fillStyle = g;
+  } else x.fillStyle = bg;
+  x.fillRect(0, 0, W, H);
+  const fy = pad + total * th + (total - 1) * gap;
+  const k = total === 1 ? 1 : 0.55;
+  if (candy) sprinkles(x, W, fy, footer, pad, total === 1 ? 1 : 0.7);
+  for (let i = 0; i < total; i++) {
+    const y = pad + i * (th + gap);
+    if (shots[i]) x.drawImage(shots[i], pad, y, tw, th);
+    else { x.fillStyle = '#6b6b75'; x.fillRect(pad, y, tw, th); }
+    if (candy) { x.lineWidth = 6; x.strokeStyle = '#fff'; x.strokeRect(pad - 3, y - 3, tw + 6, th + 6); }
+  }
+  if (candy) {
+    candyBorder(x, W, H, pad);
+    const r = pad / 2;
+    [[r, r], [W - r, r], [r, H - r], [W - r, H - r]].forEach(([cx, cy]) => peppermint(x, cx, cy, r));
+  }
+  x.fillStyle = fg; x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.font = `bold ${Math.round(80 * k) + 8}px "Segoe UI", Arial, sans-serif`;
+  x.fillText($('caption').value.trim(), W / 2, fy + footer * 0.36);
+  x.font = `${Math.round(44 * k) + 6}px "Segoe UI", Arial, sans-serif`;
+  x.fillText(new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }), W / 2, fy + footer * 0.72);
+}
+
+function buttons() {
+  $('btnCapture').disabled = busy || !stream;
+  $('btnRetake').disabled = busy;
+  $('btnSave').disabled = $('btnPrint').disabled = !complete();
+}
+
+function reset() {
+  if (busy) return;
+  shots = []; total = mode(); render(); buttons(); setStatus('Ready');
+}
+
+async function capture() {
+  if (busy || !stream) return;
+  busy = true; shots = []; total = mode(); render(); buttons();
+  const [tw, th] = tileSize();
+  for (let i = 0; i < total; i++) {
+    setStatus(`Photo ${i + 1} of ${total}`);
+    for (let n = Math.max(0, +$('cd').value || 0); n > 0; n--) { $('overlay').textContent = n; await sleep(1000); }
+    $('overlay').textContent = '';
+    shots.push(grab(tw, th)); render();
+    const f = $('flash'); f.classList.add('on'); requestAnimationFrame(() => requestAnimationFrame(() => f.classList.remove('on')));
+    if (i < total - 1) await sleep(900);
+  }
+  busy = false; setStatus('Done! Save or print your photo.'); buttons();
+}
+
+/* ---------- save + print ---------- */
+function save() {
+  if (!complete()) return;
+  const jpg = $('fmt').value === 'jpg';
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  const name = `photobooth_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${jpg ? 'jpg' : 'png'}`;
+  result.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    setStatus('Saved: ' + name);
+  }, jpg ? 'image/jpeg' : 'image/png', 0.95);
+}
+
+function printIt() {
+  if (!complete()) return;
+  const img = $('printImg');
+  img.onload = () => window.print();
+  img.src = result.toDataURL('image/png');
+}
+
+/* ---------- wiring ---------- */
+$('btnCapture').onclick = capture;
+$('btnRetake').onclick = reset;
+$('btnSave').onclick = save;
+$('btnPrint').onclick = printIt;
+document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = reset);
+$('mirror').onchange = () => { video.classList.toggle('mirror', $('mirror').checked); reset(); };
+$('caption').oninput = $('color').oninput = $('style').onchange = () => { if (!busy) render(); };
+cam.onchange = () => startCam(cam.value);
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !/INPUT|SELECT|TEXTAREA|BUTTON/.test(document.activeElement.tagName)) { e.preventDefault(); capture(); }
+});
+
+render(); buttons();
+startCam().then(buttons);
+</script>
+</body>
+</html>
